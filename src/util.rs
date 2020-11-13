@@ -5,8 +5,8 @@ use std::cmp::Ordering;
  * Extract the first element of an a LDAP search entry
  */
 pub fn get_attr<'a>(result: &'a SearchEntry, attr: &'static str) -> Option<&'a str> {
-    if let Some(Some(cn)) = result.attrs.get(attr).map(|cns| cns.get(0)) {
-        Some(cn)
+    if let Some(Some(value)) = result.attrs.get(attr).map(|cns| cns.get(0)) {
+        Some(value)
     } else {
         None
     }

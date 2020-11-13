@@ -15,22 +15,35 @@ mod util;
 
 #[derive(Debug, StructOpt)]
 /// Walk an LDAP server to discern reporting structure
+/// 
+/// Outputs a set of shell variable assignments depending on the extent of work
+/// performed.  Each is suffixed with the corresponding root user.
+/// 
+/// * If a new saved state is generated (either due to being the
+///   first run, or changes since the last): SAVESTATE_rootuser=PATH
+///
+/// * If a new reporting chain file is written: REPORTING_CHAIN_rootuser=PATH
+///
+/// * If changes are detected, the report: CHANGES_rootuser=PATH
 struct CmdlineOpts {
-    /// ID to bind with
-    #[structopt(short = "u", long)]
+    /// ID to bind with.  This may take the form of an e-mail address
+    #[structopt(short = "u", long, value_name = "USERID")]
     bind_user: String,
 
     /// LDAP server
-    #[structopt(short = "s", long)]
+    #[structopt(short = "s", long, value_name = "HOST")]
     server: String,
 
     /// LDAP search base
-    #[structopt(short = "b", long)]
+    #[structopt(short = "b", long, value_name = "DN")]
     search_base: String,
 
     /// Where to save captures
-    #[structopt(short = "d", long)]
+    #[structopt(short = "d", long, value_name = "PATH")]
     state_dir: Option<String>,
+    
+    /// User(s) highest up the food chain
+    #[structopt(value_name = "USERID")]
     root_users: Vec<String>,
 }
 
@@ -110,6 +123,7 @@ async fn main() -> Result<()> {
     for root_user in cmdline.root_users {
         build_trees(&state_dir, &root_user, &mut ldap, &cmdline.search_base).await?;
     }
+
     #[cfg(target_os = "macos")]
     if set_new_password {
         info!(
@@ -180,7 +194,11 @@ async fn build_trees(
             // Write 'em out
             let mut changes_path = state_dir.clone();
             let now = chrono::Utc::now();
-            changes_path.push(format!("{}-diffs-{}.txt", root_user, now.format("%Y-%m-%d-%H-%M-%S")));
+            changes_path.push(format!(
+                "{}-diffs-{}.txt",
+                root_user,
+                now.format("%Y-%m-%d-%H-%M-%S")
+            ));
             let mut changes_fh = tokio::fs::File::create(&changes_path).await?;
             for change in changes {
                 changes_fh.write_all(change.as_bytes()).await?;
@@ -195,8 +213,10 @@ async fn build_trees(
     };
 
     if should_write_cur_state {
-        std::fs::write(state_filepath, serde_json::to_string(&cur_state)?)?;
-        std::fs::rename(dump_filepath_tmp, dump_filepath)?;
+        std::fs::write(&state_filepath, serde_json::to_string(&cur_state)?)?;
+        println!("SAVESTATE_{}={:?}", root_user, &state_filepath);
+        std::fs::rename(dump_filepath_tmp, &dump_filepath)?;
+        println!("REPORTING_CHAIN_{}={:?}", root_user, &dump_filepath);
     } else {
         std::fs::remove_file(dump_filepath_tmp)?;
     }
