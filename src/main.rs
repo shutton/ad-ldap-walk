@@ -15,10 +15,10 @@ mod util;
 
 #[derive(Debug, StructOpt)]
 /// Walk an LDAP server to discern reporting structure
-/// 
+///
 /// Outputs a set of shell variable assignments depending on the extent of work
 /// performed.  Each is suffixed with the corresponding root user.
-/// 
+///
 /// * If a new saved state is generated (either due to being the
 ///   first run, or changes since the last): SAVESTATE_rootuser=PATH
 ///
@@ -41,7 +41,7 @@ struct CmdlineOpts {
     /// Where to save captures
     #[structopt(short = "d", long, value_name = "PATH")]
     state_dir: Option<String>,
-    
+
     /// User(s) highest up the food chain
     #[structopt(value_name = "USERID")]
     root_users: Vec<String>,
@@ -77,10 +77,12 @@ async fn main() -> Result<()> {
         match keychain.find_generic_password(&cmdline.server, &cmdline.bind_user) {
             Err(e) => match &e.code() {
                 -25300 => {
+                    info!("Password not found in macOS Keychain");
                     break (
                         rpassword::read_password_from_tty(Some(
                             format!("Enter password for {}: ", cmdline.server).as_str(),
-                        ))?,
+                        ))
+                        .map_err(|e| anyhow!("Failed to read password from TTY: {}", e))?,
                         true,
                     );
                 }
@@ -92,8 +94,9 @@ async fn main() -> Result<()> {
         }
     };
 
-    let (conn, mut ldap) =
-        LdapConnAsync::new(format!("ldap://{}", cmdline.server).as_ref()).await?;
+    let (conn, mut ldap) = LdapConnAsync::new(format!("ldap://{}", cmdline.server).as_ref())
+        .await
+        .map_err(|e| anyhow!("Unable to connect to {}: {}", cmdline.server, e))?;
 
     // This thing just sits in the background
     let _cxnhandle = tokio::spawn(async move {
@@ -102,26 +105,29 @@ async fn main() -> Result<()> {
         }
     });
 
-    ldap.simple_bind(&cmdline.bind_user, &password).await?;
+    ldap.simple_bind(&cmdline.bind_user, &password)
+        .await
+        .map_err(|e| anyhow!("Unable to bind to {}: {}", cmdline.server, e))?;
     if cmdline.root_users.is_empty() {
         return Err(anyhow!("root user(s) not specified"));
     }
 
-    let state_dir = PathBuf::from(
-        &cmdline
-            .state_dir
-            .unwrap_or_else(|| format!("{}/.ldap-walk/", std::env::var("HOME").unwrap())),
-    );
+    let state_dir: PathBuf = match &cmdline.state_dir {
+        Some(dir) => dir.into(),
+        None => format!("{}/.ldap-walk/", std::env::var("HOME").unwrap()).into(),
+    };
     let mut people_dir = state_dir.clone();
     people_dir.push("people");
     std::fs::create_dir_all(&state_dir)
-        .map_err(|e| anyhow!("Unable to create directory ({:?}): {}", state_dir, e))?;
+        .map_err(|e| anyhow!("Unable to create directory ({:?}): {}", &state_dir, e))?;
     // Do this in a separate operation just to make for a better error message
     std::fs::create_dir_all(&people_dir)
         .map_err(|e| anyhow!("Unable to create directory ({:?}): {}", people_dir, e))?;
 
-    for root_user in cmdline.root_users {
-        build_trees(&state_dir, &root_user, &mut ldap, &cmdline.search_base).await?;
+    for root_user in &cmdline.root_users {
+        build_trees(&state_dir, &root_user, &mut ldap, &cmdline.search_base)
+            .await
+            .map_err(|e| anyhow!("Walking tree for {}: {}", root_user, e))?;
     }
 
     #[cfg(target_os = "macos")]
@@ -133,7 +139,9 @@ async fn main() -> Result<()> {
         use security_framework::os::macos::keychain::SecKeychain;
         let mut keychain = SecKeychain::default()?;
         keychain.unlock(None)?;
-        keychain.set_generic_password(&cmdline.server, &cmdline.bind_user, password.as_bytes())?;
+        keychain
+            .set_generic_password(&cmdline.server, &cmdline.bind_user, password.as_bytes())
+            .map_err(|e| anyhow!("Unable to save password for {}: {}", &cmdline.bind_user, e))?;
     }
 
     Ok(())
@@ -151,7 +159,9 @@ async fn build_trees(
     dump_filepath.push(format!("{}-hier.txt", root_user));
     let mut dump_filepath_tmp = state_dir.clone();
     dump_filepath_tmp.push(format!(".{}-hier.txt.tmp", root_user));
-    let mut hier_fh = tokio::fs::File::create(&dump_filepath_tmp).await?;
+    let mut hier_fh = tokio::fs::File::create(&dump_filepath_tmp)
+        .await
+        .map_err(|e| anyhow!("Unable to create {:?}: {}", &dump_filepath_tmp, e))?;
 
     let emp_manager: BTreeMap<String, String> = BTreeMap::new();
     let manager_reports: BTreeMap<String, Vec<String>> = BTreeMap::new();
@@ -170,7 +180,9 @@ async fn build_trees(
         let query_str = build_query(&mut remaining);
         debug!("querying {:?}", query_str);
         n_queries += 1;
-        let mut results = query(ldap, &search_base, &query_str).await?;
+        let mut results = query(ldap, &search_base, &query_str)
+            .await
+            .map_err(|e| anyhow!("Failed to query {}: {}", &query_str, e))?;
         results.sort_by(|a, b| cmp_attr(a, b, "cn"));
         for result in results {
             handle_result(
@@ -186,7 +198,8 @@ async fn build_trees(
     info!("Completed with {} individual queries", n_queries);
 
     let should_write_cur_state = if let Ok(old_ss_fh) = std::fs::File::open(&state_filepath) {
-        let old_ss: SavedState = serde_json::from_reader(old_ss_fh)?;
+        let old_ss: SavedState = serde_json::from_reader(old_ss_fh)
+            .map_err(|e| anyhow!("Failed to parse JSON from {:?}: {}", &state_filepath, e))?;
         let changes = find_changes(&old_ss, &cur_state);
         if changes.is_empty() {
             false
@@ -199,10 +212,15 @@ async fn build_trees(
                 root_user,
                 now.format("%Y-%m-%d-%H-%M-%S")
             ));
-            let mut changes_fh = tokio::fs::File::create(&changes_path).await?;
-            for change in changes {
-                changes_fh.write_all(change.as_bytes()).await?;
-                changes_fh.write_all(b"\n").await?;
+            let mut changes_fh = tokio::fs::File::create(&changes_path)
+                .await
+                .map_err(|e| anyhow!("Failed to create {:?}: {}", &changes_path, e))?;
+            for mut change in changes {
+                change.push('\n');
+                changes_fh
+                    .write_all(change.as_bytes())
+                    .await
+                    .map_err(|e| anyhow!("Failed to write to {:?}: {}", &changes_path, e))?;
             }
             println!("CHANGES_{}={:?}", root_user, changes_path);
             true
