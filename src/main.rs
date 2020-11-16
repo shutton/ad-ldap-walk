@@ -42,6 +42,10 @@ struct CmdlineOpts {
     #[structopt(short = "d", long, value_name = "PATH")]
     state_dir: Option<String>,
 
+    /// Save individual entries
+    #[structopt(short = "c", long)]
+    cache_people: bool,
+
     /// User(s) highest up the food chain
     #[structopt(value_name = "USERID")]
     root_users: Vec<String>,
@@ -117,7 +121,7 @@ async fn main() -> Result<()> {
         None => format!("{}/.ldap-walk/", std::env::var("HOME").unwrap()).into(),
     };
     let mut people_dir = state_dir.clone();
-    people_dir.push("people");
+    people_dir.push("entries");
     std::fs::create_dir_all(&state_dir)
         .map_err(|e| anyhow!("Unable to create directory ({:?}): {}", &state_dir, e))?;
     // Do this in a separate operation just to make for a better error message
@@ -125,9 +129,16 @@ async fn main() -> Result<()> {
         .map_err(|e| anyhow!("Unable to create directory ({:?}): {}", people_dir, e))?;
 
     for root_user in &cmdline.root_users {
-        build_trees(&state_dir, &root_user, &mut ldap, &cmdline.search_base)
-            .await
-            .map_err(|e| anyhow!("Walking tree for {}: {}", root_user, e))?;
+        build_trees(
+            &state_dir,
+            &root_user,
+            &mut ldap,
+            &cmdline.search_base,
+            &people_dir,
+            cmdline.cache_people,
+        )
+        .await
+        .map_err(|e| anyhow!("Walking tree for {}: {}", root_user, e))?;
     }
 
     #[cfg(target_os = "macos")]
@@ -152,6 +163,8 @@ async fn build_trees(
     root_user: &str,
     ldap: &mut Ldap,
     search_base: &str,
+    people_dir: &PathBuf,
+    cache_people: bool,
 ) -> Result<()> {
     let mut state_filepath = state_dir.clone();
     state_filepath.push(format!("{}.json", root_user));
@@ -177,6 +190,7 @@ async fn build_trees(
 
     let mut n_queries: i32 = 0;
     while !remaining.is_empty() {
+        let mut people_entries = vec![];
         let query_str = build_query(&mut remaining);
         debug!("querying {:?}", query_str);
         n_queries += 1;
@@ -185,14 +199,35 @@ async fn build_trees(
             .map_err(|e| anyhow!("Failed to query {}: {}", &query_str, e))?;
         results.sort_by(|a, b| cmp_attr(a, b, "cn"));
         for result in results {
+            let this_username = get_attr(&result, "cn")
+                .ok_or_else(|| anyhow!("Record for {} missing CN", result.dn))?;
+
+            if cache_people {
+                people_entries.push((this_username.to_owned(), format!("{:#?}", &result)));
+            }
+
             handle_result(
+                this_username,
                 &result,
                 &mut cur_state,
                 &mut remaining,
                 &root_user,
                 &mut hier_fh,
             )
-            .await?
+            .await?;
+        }
+
+        if !people_entries.is_empty() {
+            let people_dir = people_dir.clone();
+            tokio::spawn(async move {
+                for (username, entry) in people_entries {
+                    let mut path = people_dir.clone();
+                    path.push(format!("{}.txt", username));
+                    if let Err(e) = tokio::fs::write(&path, entry).await {
+                        warn!("Unable to write to {:?}: {}", path, e);
+                    }
+                }
+            });
         }
     }
     info!("Completed with {} individual queries", n_queries);
@@ -242,15 +277,13 @@ async fn build_trees(
 }
 
 async fn handle_result(
+    this_username: &str,
     result: &SearchEntry,
     cur_state: &mut SavedState,
     remaining: &mut VecDeque<String>,
     root_user: &str,
     heir_fh: &mut tokio::fs::File,
 ) -> Result<()> {
-    let this_username =
-        get_attr(&result, "cn").ok_or_else(|| anyhow!("Record for {} missing CN", result.dn))?;
-
     if let Some(Some(manager_userid)) = result
         .attrs
         .get("manager")
@@ -416,7 +449,7 @@ fn compare_reports(old_ss: &SavedState, cur_ss: &SavedState) -> Vec<String> {
             // Something changed?  Go find it
             if old_reports != cur_reports {
                 let mut old_reports: HashSet<String> = old_reports.clone().into_iter().collect();
-                cur_reports.into_iter().for_each(|cur_report| {
+                cur_reports.iter().for_each(|cur_report| {
                     if !old_reports.contains(cur_report) {
                         new_reports.push(cur_report);
                     } else {
